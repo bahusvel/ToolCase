@@ -8,6 +8,7 @@ import (
 	"github.com/fsouza/go-dockerclient"
 	"github.com/codegangsta/cli"
 	"errors"
+	"io"
 )
 
 var dService = &DockerService{}
@@ -17,6 +18,7 @@ type DockerService struct {
 }
 
 func (this *DockerService) init() error {
+	// TODO get the information automatically from docker-machine env default
 	endpoint := "tcp://192.168.99.101:2376"
     path := "/Users/denislavrov/.docker/machine/machines/default"
     ca := fmt.Sprintf("%s/ca.pem", path)
@@ -40,7 +42,6 @@ func forwardX11Socket(){
 }
 
 func newApp(image string, container_name string){
-	// TODO get the information automatically from docker-machine env default
 	client := dService.client
 	config := docker.Config{Image:image, Env:[]string{"DISPLAY=192.168.99.1:0"}}
 	opts := docker.CreateContainerOptions{Name:container_name, Config:&config}
@@ -57,33 +58,34 @@ func newApp(image string, container_name string){
 }
 
 func runApp(container_name string){
-	// TODO get the information automatically from docker-machine env default
 	client := dService.client
-	containers, err := client.ListContainers(docker.ListContainersOptions{All:true})
+	container, err := containerByName(container_name)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(-1)
 	}
+	err = client.StartContainer(container.ID, nil)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(-1)
+	}
+}
 
+func containerByName(container_name string) (*docker.APIContainers, error){
+	containers, err := dService.client.ListContainers(docker.ListContainersOptions{All:true})
+	if err != nil {
+		return nil, err
+	}
 	container_name = "/" + container_name
-	container_id := ""
 	for _, container := range containers{
 		for _, name := range container.Names{
 			if name == container_name {
-				container_id = container.ID
-				break
+				return &container, nil
 			}
 		}
 	}
-	if container_id == "" {
-		fmt.Println("Container by that name was not found")
-		os.Exit(-1)
-	}
-	err = client.StartContainer(container_id, nil)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(-1)
-	}
+
+	return nil, errors.New("Container by that name was not found")
 }
 
 func checkChanges(containerID string){
@@ -98,6 +100,25 @@ func checkChanges(containerID string){
 		for _, change := range changes{
 			fmt.Println(change.Path, change.Kind)
 		}
+	}
+}
+
+/*
+ This function is for storing the app configuration once you are happy with it
+ This will not happen automatically, it is up to the user to call this, as a result
+ a new image will be create that can be used later to distribute it, and keep the configuration
+ this is somewhat of a service snapshoting feature.
+*/
+func exportApp(containerID string, outputStream io.Writer){
+	image, err := dService.client.CommitContainer(docker.CommitContainerOptions{Container:containerID})
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(-1)
+	}
+	err = dService.client.ExportImage(docker.ExportImageOptions{Name:image.ID, OutputStream:outputStream})
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(-1)
 	}
 }
 
@@ -141,8 +162,27 @@ func main(){
       	return nil
     }}
 
+	export := cli.Command{
+    Name:        "export",
+    Usage:       "supply container_name file_out as aguments",
+    Action: func(c *cli.Context) error {
+		container, err := containerByName(c.Args()[0])
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(-1)
+		}
+		f, err := os.Create(c.Args()[1])
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(-1)
+		}
+		exportApp(container.ID, f)
+      	return nil
+    }}
+
 	app.Commands = append(app.Commands, changes)
 	app.Commands = append(app.Commands, new)
 	app.Commands = append(app.Commands, run)
+	app.Commands = append(app.Commands, export)
 	app.Run(os.Args)
 }
