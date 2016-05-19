@@ -100,6 +100,16 @@ func forward(conn net.Conn, unixSocketName string) {
 	}()
 }
 
+func remoteFS(){
+	/*
+	https://gist.github.com/codeinthehole/7ea69f8a21c67cc07293
+
+	One needs to SSH into docker-machine and install the sshfs-fuse
+	The SSH private key can be found using: docker-machine inspect default
+	Then SSH to default port 22, to the IP of the machine
+	*/
+}
+
 func newX11Forward() error {
 	guiPortNumber := "6000"
 	displayVariable := os.Getenv("DISPLAY")
@@ -240,8 +250,7 @@ func main() {
 		Name:  "run",
 		Usage: "supply container_name as agument",
 		Action: func(c *cli.Context) error {
-			newX11Forward()
-			fmt.Println()
+			forwardX11Socket()
 			runApp(c.Args()[0])
 			return nil
 		}}
