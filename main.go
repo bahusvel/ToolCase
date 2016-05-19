@@ -1,35 +1,77 @@
 package main
 
 import (
-	"os/exec"
-	"os"
 	"fmt"
+	"os"
+	"os/exec"
 	//"time"
-	"github.com/fsouza/go-dockerclient"
-	"github.com/codegangsta/cli"
 	"errors"
+	"github.com/codegangsta/cli"
+	"github.com/fsouza/go-dockerclient"
 	"io"
+	"net"
+	"strings"
 )
 
 var dService = &DockerService{}
 
 type DockerService struct {
-	client 	*docker.Client
+	client *docker.Client
+	endpoint string
+	path string
+}
+
+func (this *DockerService) startDocker() {
+	cmd := exec.Command("docker-machine", "start", "default")
+	cmd.Run()
+}
+
+func (this *DockerService) getEnvs(){
+	cmd := exec.Command("docker-machine", "env", "default")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Could not get ENVS")
+		os.Exit(-1)
+	}
+	lines := strings.Split(string(output), "\n")
+	envs := make(map[string] string)
+	for _, line := range lines {
+		parts := strings.Split(line, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.Split(parts[0], " ")[1]
+		value := strings.Replace(parts[1], "\"", "", -1)
+		envs[name] = value
+	}
+
+	fmt.Println(envs)
+	if val, ok := envs["DOCKER_HOST"]; ok {
+		this.endpoint = val
+	} else {
+		fmt.Println("Could not get ENVS")
+		os.Exit(-1)
+	}
+	if val, ok := envs["DOCKER_CERT_PATH"]; ok {
+		this.path = val
+	} else {
+		fmt.Println("Could not get ENVS")
+		os.Exit(-1)
+	}
 }
 
 func (this *DockerService) init() error {
-	// TODO get the information automatically from docker-machine env default
-	endpoint := "tcp://192.168.99.101:2376"
-    path := "/Users/denislavrov/.docker/machine/machines/default"
-    ca := fmt.Sprintf("%s/ca.pem", path)
-    cert := fmt.Sprintf("%s/cert.pem", path)
-    key := fmt.Sprintf("%s/key.pem", path)
-    client, err := docker.NewTLSClient(endpoint, cert, key, ca)
+	this.startDocker()
+	this.getEnvs()
+	ca := fmt.Sprintf("%s/ca.pem", this.path)
+	cert := fmt.Sprintf("%s/cert.pem", this.path)
+	key := fmt.Sprintf("%s/key.pem", this.path)
+	client, err := docker.NewTLSClient(this.endpoint, cert, key, ca)
 	this.client = client
 	return err
 }
 
-func forwardX11Socket(){
+func forwardX11Socket() {
 	// TODO rewrite using native go code, take some code from here https://github.com/matthieudelaro/nut
 	display := os.Getenv("DISPLAY")
 	if display == "" {
@@ -41,10 +83,51 @@ func forwardX11Socket(){
 	go cmd.Run()
 }
 
-func newApp(image string, container_name string){
+func forward(conn net.Conn, unixSocketName string) {
+	client, err := net.Dial("unix", unixSocketName)
+	if err != nil {
+		fmt.Println("forward: Dial failed: %v", err)
+	}
+	go func() {
+		defer client.Close()
+		defer conn.Close()
+		io.Copy(client, conn)
+	}()
+	go func() {
+		defer client.Close()
+		defer conn.Close()
+		io.Copy(conn, client)
+	}()
+}
+
+func newX11Forward() error {
+	guiPortNumber := "6000"
+	displayVariable := os.Getenv("DISPLAY")
+	if displayVariable == "" {
+		return errors.New("DISPLAY variable is empty. (Did you install XQuartz properly?)")
+	} else {
+		go func() {
+			listener, err := net.Listen("tcp", "0.0.0.0:"+guiPortNumber)
+			if err != nil {
+				fmt.Println("Failed to setup listener: %v", err)
+			} else {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						fmt.Println("ERROR: failed to accept listener: %v", err)
+					}
+					go forward(conn, displayVariable)
+				}
+			}
+		}()
+	}
+	return nil
+}
+
+func newApp(image string, container_name string) {
 	client := dService.client
-	config := docker.Config{Image:image, Env:[]string{"DISPLAY=192.168.99.1:0"}}
-	opts := docker.CreateContainerOptions{Name:container_name, Config:&config}
+	config := docker.Config{Image: image, Env: []string{"DISPLAY=192.168.99.1:0"}}
+	opts := docker.CreateContainerOptions{Name: container_name, Config: &config}
 	container, err := client.CreateContainer(opts)
 	if err != nil {
 		fmt.Println(err)
@@ -57,7 +140,7 @@ func newApp(image string, container_name string){
 	}
 }
 
-func runApp(container_name string){
+func runApp(container_name string) {
 	client := dService.client
 	container, err := containerByName(container_name)
 	if err != nil {
@@ -71,14 +154,14 @@ func runApp(container_name string){
 	}
 }
 
-func containerByName(container_name string) (*docker.APIContainers, error){
-	containers, err := dService.client.ListContainers(docker.ListContainersOptions{All:true})
+func containerByName(container_name string) (*docker.APIContainers, error) {
+	containers, err := dService.client.ListContainers(docker.ListContainersOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
 	container_name = "/" + container_name
-	for _, container := range containers{
-		for _, name := range container.Names{
+	for _, container := range containers {
+		for _, name := range container.Names {
 			if name == container_name {
 				return &container, nil
 			}
@@ -88,7 +171,7 @@ func containerByName(container_name string) (*docker.APIContainers, error){
 	return nil, errors.New("Container by that name was not found")
 }
 
-func checkChanges(containerID string){
+func checkChanges(containerID string) {
 	changes, err := dService.client.ContainerChanges(containerID)
 	if err != nil {
 		fmt.Println(err)
@@ -97,7 +180,7 @@ func checkChanges(containerID string){
 	if len(changes) == 0 {
 		fmt.Println(0)
 	} else {
-		for _, change := range changes{
+		for _, change := range changes {
 			fmt.Println(change.Path, change.Kind)
 		}
 	}
@@ -109,20 +192,20 @@ func checkChanges(containerID string){
  a new image will be create that can be used later to distribute it, and keep the configuration
  this is somewhat of a service snapshoting feature.
 */
-func exportApp(containerID string, outputStream io.Writer){
-	image, err := dService.client.CommitContainer(docker.CommitContainerOptions{Container:containerID})
+func exportApp(containerID string, outputStream io.Writer) {
+	image, err := dService.client.CommitContainer(docker.CommitContainerOptions{Container: containerID})
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(-1)
 	}
-	err = dService.client.ExportImage(docker.ExportImageOptions{Name:image.ID, OutputStream:outputStream})
+	err = dService.client.ExportImage(docker.ExportImageOptions{Name: image.ID, OutputStream: outputStream})
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(-1)
 	}
 }
 
-func main(){
+func main() {
 	err := dService.init()
 	if err != nil {
 		fmt.Println(err)
@@ -130,55 +213,56 @@ func main(){
 	}
 
 	app := cli.NewApp()
-  	app.Name = "toolcase"
-  	app.Usage = "carry your tools with you"
+	app.Name = "toolcase"
+	app.Usage = "carry your tools with you"
 
 	changes := cli.Command{
-    Name:        "changes",
-    Usage:       "supply container id as argument",
-    Action: func(c *cli.Context) error {
-      	checkChanges(c.Args()[0])
-      	return nil
-    }}
+		Name:  "changes",
+		Usage: "supply container id as argument",
+		Action: func(c *cli.Context) error {
+			checkChanges(c.Args()[0])
+			return nil
+		}}
 
 	new := cli.Command{
-    Name:        "new",
-    Usage:       "image_name container_name (container_name is up to you)",
-    Action: func(c *cli.Context) error {
-		if len(c.Args()) == 2 {
-			forwardX11Socket()
-			newApp(c.Args()[0], c.Args()[1])
-			return nil
-		}
-      	return errors.New("wrong arguments")
-    }}
+		Name:  "new",
+		Usage: "image_name container_name (container_name is up to you)",
+		Action: func(c *cli.Context) error {
+			if len(c.Args()) == 2 {
+				forwardX11Socket()
+				newApp(c.Args()[0], c.Args()[1])
+				return nil
+			}
+			return errors.New("wrong arguments")
+		}}
 
 	run := cli.Command{
-    Name:        "run",
-    Usage:       "supply container_name as agument",
-    Action: func(c *cli.Context) error {
-		forwardX11Socket()
-		runApp(c.Args()[0])
-      	return nil
-    }}
+		Name:  "run",
+		Usage: "supply container_name as agument",
+		Action: func(c *cli.Context) error {
+			newX11Forward()
+			fmt.Println()
+			runApp(c.Args()[0])
+			return nil
+		}}
 
 	export := cli.Command{
-    Name:        "export",
-    Usage:       "supply container_name file_out as aguments",
-    Action: func(c *cli.Context) error {
-		container, err := containerByName(c.Args()[0])
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(-1)
-		}
-		f, err := os.Create(c.Args()[1])
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(-1)
-		}
-		exportApp(container.ID, f)
-      	return nil
-    }}
+		Name:  "export",
+		Usage: "supply container_name file_out as aguments",
+		Action: func(c *cli.Context) error {
+			container, err := containerByName(c.Args()[0])
+			if err != nil {
+				fmt.Println(err)
+				os.Exit(-1)
+			}
+			f, err := os.Create(c.Args()[1])
+			if err != nil {
+				fmt.Println(err)
+				os.Exit(-1)
+			}
+			exportApp(container.ID, f)
+			return nil
+		}}
 
 	app.Commands = append(app.Commands, changes)
 	app.Commands = append(app.Commands, new)
